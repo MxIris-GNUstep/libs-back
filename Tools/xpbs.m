@@ -133,21 +133,36 @@ static Atom atoms[sizeof(atom_names)/sizeof(char*)];
  */
 @interface	Incremental : NSObject
 {
-  NSTimeInterval	start;
-  const char	*pname;
-  const char	*tname;
-  NSData	*data;
-  NSInteger	offset;
-  int		format;
-  int		chunk;
-  Atom		xType;
-  Window	window;
-  Atom		property;
+  NSTimeInterval	start;		/* Timestamp start of transfer */
+  const char		*pname;		/* The target property name */
+  const char		*tname; 	/* The data type */
+  NSData		*data;		/* Data to be transferred */
+  NSInteger		offset;		/* Bytes sent so far */
+  int			format;		/* X format; 8, 16, or 32 bit values */
+  int			chunk;		/* Max bytes per change */
+  Atom			xType;		/* The data type atom */
+  Atom			property;	/* The property atom */
+  Window		window;		/* The target window */
 }
+
+/* Find an active transfer object for a trget property and window.
+ */
 + (Incremental*) findINCR: (Atom)p for: (Window)w;
+
+/* Create an active transfer object for a trget property and window.
+ */
 + (Incremental*) makeINCR: (Atom)p for: (Window)w;
+
+/* Abort a transfer by setting the target property to an empty value.
+ */
 - (void) abort;
+
+/* deal with a property deletion event ... transfer the next chunk.
+ */
 - (void) propertyDeleted;
+
+/* Set up a transfer.
+ */
 - (void) setData: (NSData*)d type: (Atom)t format: (int)f chunk: (int)c;
 @end
 
@@ -223,7 +238,9 @@ static Window		xAppWin;
 static NSMapTable	*ownByX;
 static NSMapTable	*ownByO;
 static NSString		*xWaitMode = @"XPasteboardWaitMode";
+#if HAVE_XFIXES
 static int              xFixesEventBase;
+#endif
 
 @implementation	XPbOwner
 
@@ -941,12 +958,14 @@ xErrorHandler(Display *d, XErrorEvent *e)
   [self setOwnedByOpenStep: NO];
 }
 
-- (NSMutableData*) getSelectionData: (XSelectionEvent*)xEvent
-                               type: (Atom*)type
-			       size: (long)max
+- (long) getSelectionData: (XSelectionEvent*)xEvent
+		     type: (Atom*)type
+		     size: (long)max
+		     into: (NSMutableData*)md
 {
   int		status;
   unsigned char	*data;
+  long		bytes_added = 0L;
   long		long_offset = 0L;
   long 		long_length = FULL_LENGTH;
   Atom 		req_type = AnyPropertyType;
@@ -954,7 +973,7 @@ xErrorHandler(Display *d, XErrorEvent *e)
   int		actual_format;
   unsigned long	bytes_remaining;
   unsigned long	number_items;
-  NSMutableData	*md = nil;
+  BOOL		initial = YES;
 
   if (max > long_length) long_length = max;
   /*
@@ -965,9 +984,9 @@ xErrorHandler(Display *d, XErrorEvent *e)
       status = XGetWindowProperty(xDisplay,
 	xEvent->requestor,
 	xEvent->property,
-	long_offset,         // offset
+	long_offset,
 	long_length,
-	False,               // Aug 2011 - changed to False (don't delete property)
+	True,			// delete after read (iff bytes_remaining == 0)
 	req_type,
 	&actual_type,
 	&actual_format,
@@ -999,12 +1018,20 @@ xErrorHandler(Display *d, XErrorEvent *e)
 	      count = number_items * actual_format / 8;
 	    }
             
-          if (md == nil)
+          if (initial)
             {
+	      NSUInteger	capacity = [md capacity];
+	      int		space = capacity - [md length];
+	      int		need = count + bytes_remaining;
+
 	      /* data buffer needs to be big enough for the whole property
 	       */
-              md = [[NSMutableData alloc]
-		initWithCapacity: count + bytes_remaining];
+	      initial = NO;
+	      if (space < need)
+		{
+		  capacity += need - space;
+		  [md setCapacity: capacity];
+		}
               req_type = actual_type;
             }
           else if (req_type != actual_type)
@@ -1016,15 +1043,14 @@ xErrorHandler(Display *d, XErrorEvent *e)
 		    req_name, act_name);
 	      XFree(req_name);
 	      XFree(act_name);
-	      RELEASE(md);
 	      if (data)
 		{
 		  XFree(data);
 		}
-	      return nil;
+	      return 0;
             }
           [md appendBytes: (void *)data length: count];
-          
+          bytes_added += count;
           long_offset += count / 4;
           if (data)
             {
@@ -1037,19 +1063,18 @@ xErrorHandler(Display *d, XErrorEvent *e)
   if (status == Success)
     {
       *type = actual_type;
-      return AUTORELEASE(md);
+      return bytes_added;
     }
   else
     {
-      RELEASE(md);
-      return nil;
+      return 0;
     }
 }
 
 - (void) xSelectionNotify: (XSelectionEvent*)xEvent
 {
   Atom actual_type;
-  NSMutableData	*md = nil;
+  NSMutableData	*md;
 
   if (xEvent->property == (Atom)None)
     {
@@ -1066,9 +1091,8 @@ xErrorHandler(Display *d, XErrorEvent *e)
     }
   [self setWaitingForSelection: 0];
 
-  md = [self getSelectionData: xEvent type: &actual_type size: 0];
-
-  if (md != nil)
+  md = [NSMutableData dataWithCapacity: FULL_LENGTH];
+  if ([self getSelectionData: xEvent type: &actual_type size: 0 into: md] > 0)
     {
       unsigned	count = 0;
 
@@ -1078,12 +1102,22 @@ xErrorHandler(Display *d, XErrorEvent *e)
           BOOL		wait = YES;
 	  int32_t	size;
 
-	  // Need to delete the property to start transfer
-	  XDeleteProperty(xDisplay, xEvent->requestor, xEvent->property);
+	  /* The -getSelectionData:type:size: method already deleted the
+	   * property so the remote end should know it can start sending.
+	   */
 	  memcpy(&size, [md bytes], 4);
 	  NSDebugMLLog(@"INCR",
 	    @"Size for INCR chunks is %u bytes.", (unsigned)size);
           [md setLength: 0];
+
+	  /* We expect to read multiple chunks, so to avoid excessive
+	   * reallocation of memory we grow the buffer to be big enough
+	   * to hold ten of them.
+	   */
+	  if (size * 10 > [md capacity])
+	    {
+	      [md setCapacity: size * 10];
+	    }
           while (wait)
             {
               XNextEvent(xDisplay, &event);
@@ -1091,37 +1125,30 @@ xErrorHandler(Display *d, XErrorEvent *e)
               if (event.type == PropertyNotify
 	        && event.xproperty.state == PropertyNewValue)
                 {
-		  ENTER_POOL
-		  NSMutableData	*imd;
+		  long	length;
 
-                  imd = [self getSelectionData: xEvent
-					  type: &actual_type
-					  size: size];
-
-		  /* Delete the property to get the next transfer chunk
-		   * or clean up if the end of transfer was indicated by
-		   * an empty chunk.
+		  /* Getting the property data also deletes the property,
+		   * telling the other end to send the next chunk.
+		   * An empty chunk indicates end of transfer.
 		   */
-		  XDeleteProperty(xDisplay,
-		    xEvent->requestor, xEvent->property);
-                  if (imd != nil)
+                  if ((length = [self getSelectionData: xEvent
+						  type: &actual_type
+						  size: size
+						  into: md]) > 0)
                     {
 		      if (GSDebugSet(@"INCR"))
 			{
 			  char *name = XGetAtomName(xDisplay, actual_type);
-			  NSLog(@"Retrieved %lu bytes type '%s'"
-			    @" from X selection.", 
-			    (unsigned long)[imd length], name);
+			  NSLog(@"Retrieved %ld bytes type '%s'"
+			    @" from X selection.", length, name);
 			  XFree(name);
 			}
 		      count++;
-		      [md appendData: imd];
                     }
                   else
                     {
                       wait = NO;
                     }
-		  LEAVE_POOL
                 }
             }
 	  if ([md length] == 0)
@@ -1149,7 +1176,7 @@ xErrorHandler(Display *d, XErrorEvent *e)
 	}
     }
   
-  if (md != nil)
+  if ([md length] > 0)
     {
       // Convert data to text string.
       if (actual_type == XG_UTF8_STRING)
@@ -1333,9 +1360,29 @@ xErrorHandler(Display *d, XErrorEvent *e)
 
       xType = XA_ATOM;
       format = 32;
-      numItems = numTypes;
       data = [NSData dataWithBytes: (const void*)xTypes
       			    length: numTypes*sizeof(Atom)];
+      numItems = numTypes;
+      if (GSDebugSet(@"Pbs"))
+	{
+	  NSMutableString	*m;
+	  int			i;
+	  Atom			*a = (Atom*)[data bytes];  
+
+	  m = [NSMutableString stringWithCapacity: numItems * 20];
+	  for (i = 0; i < numItems; i++)
+	    {
+	      char	*t = XGetAtomName(xDisplay, a[i]);
+	
+	      if (i > 0)
+		{
+		  [m appendString: @","];
+		}
+	      [m appendFormat: @"%s", t];
+	      XFree(t);
+	    }
+	  NSLog(@"TARGETS supplies %@ for %@", m, types);
+	}
     }
   else if (xEvent->target == XG_TIMESTAMP)
     {
@@ -1569,7 +1616,7 @@ xErrorHandler(Display *d, XErrorEvent *e)
       XFree(t);
     }
 
-  /* Assume properties ebigger than a quarter of the maximum
+  /* Assume properties bigger than a quarter of the maximum
    * request size need to use INCR (ICCCM section 2.5)
    */
   if (0 == chunk)
