@@ -83,7 +83,8 @@ static char *atom_names[] = {
   "image/svg",
   "application/rtf",
   "text/richtext",
-  "text/plain;charset=utf-8"
+  "text/plain;charset=utf-8",
+  "application/pdf"
 };
 static Atom atoms[sizeof(atom_names)/sizeof(char*)];
 
@@ -128,6 +129,7 @@ static Atom atoms[sizeof(atom_names)/sizeof(char*)];
 #define XG_MIME_APP_RTF   atoms[34]
 #define XG_MIME_TEXT_RICHTEXT atoms[35]
 #define XG_MIME_UTF8		atoms[36]
+#define XG_MIME_PDF       	atoms[37]
 
 /** Return the GNUstep pasteboard type corresponding to the given atom
  * or nil if there is no corresponding type.
@@ -156,6 +158,22 @@ NSPasteboardTypeFromAtom(Atom type)
     || XG_MIME_TEXT_RICHTEXT == type)
     {
       return NSRTFPboardType;
+    }
+
+  if (XG_MIME_HTML == type
+    || XG_MIME_XHTML == type)
+    {
+      return NSHTMLPboardType;
+    }
+
+  if (XG_MIME_URI == type)
+    {
+      return NSURLPboardType;
+    }
+
+  if (XG_MIME_PDF == type)
+    {
+      return NSPasteboardTypePDF;
     }
 
   if (XG_MIME_PNG == type)
@@ -856,7 +874,19 @@ static int              xFixesEventBase;
   else if ([type isEqual: NSPasteboardTypePNG])
     {
       NSDebugLLog(@"Pbs", @"pasteboard: provideDataForType: - requestData XG_MIME_PNG");
-      [self requestData: XG_MIME_PNG];
+      [self requestData: (xType = XG_MIME_PNG)];
+    }
+  else if ([type isEqual: NSPasteboardTypePDF])
+    {
+      [self requestData: (xType = XG_MIME_PDF)];
+    }
+  else if ([type isEqual: NSHTMLPboardType])
+    {
+      [self requestData: (xType = XG_MIME_HTML)];
+    }
+  else if ([type isEqual: NSURLPboardType])
+    {
+      [self requestData: (xType = XG_MIME_URI)];
     }
   // FIXME: Support more types
   else
@@ -1327,7 +1357,20 @@ xErrorHandler(Display *d, XErrorEvent *e)
         {
           [self setData: md];
         }
+      else if ((actual_type == XG_MIME_HTML)
+        || (actual_type == XG_MIME_XHTML))
+        {
+          [self setData: md];
+        }
+      else if (actual_type == XG_MIME_URI)
+        {
+          [self setData: md];
+        }
       else if (actual_type == XG_MIME_TIFF)
+        {
+          [self setData: md];
+        }
+      else if (actual_type == XG_MIME_PDF)
         {
           [self setData: md];
         }
@@ -1414,7 +1457,7 @@ xErrorHandler(Display *d, XErrorEvent *e)
     {
       unsigned	numTypes = 0;
       // ATTENTION: Increase this array when adding more types
-      Atom	xTypes[18];
+      Atom	xTypes[22];
       
       /*
        * The requestor wants a list of the types we can supply it with.
@@ -1450,9 +1493,25 @@ xErrorHandler(Display *d, XErrorEvent *e)
 	  xTypes[numTypes++] = XG_MIME_TEXT_RICHTEXT;
         }
 
+      if ([types containsObject: NSHTMLPboardType])
+        {
+          xTypes[numTypes++] = XG_MIME_HTML;
+          xTypes[numTypes++] = XG_MIME_XHTML;
+        }
+
+      if ([types containsObject: NSURLPboardType])
+        {
+          xTypes[numTypes++] = XG_MIME_URI;
+        }
+
       if ([types containsObject: NSTIFFPboardType])
         {
           xTypes[numTypes++] = XG_MIME_TIFF;
+        }
+
+      if ([types containsObject: NSPasteboardTypePDF])
+        {
+          xTypes[numTypes++] = XG_MIME_PDF;
         }
 
       if ([types containsObject: NSPasteboardTypePNG])
@@ -1548,9 +1607,24 @@ xErrorHandler(Display *d, XErrorEvent *e)
           xEvent->target = XG_MIME_TIFF;
           [self xProvideSelection: xEvent];
         }
+      else if ([types containsObject: NSPasteboardTypePDF])
+        {
+          xEvent->target = XG_MIME_PDF;
+          [self xProvideSelection: xEvent];
+        }
       else if ([types containsObject: NSPasteboardTypePNG])
         {
           xEvent->target = XG_MIME_PNG;
+          [self xProvideSelection: xEvent];
+        }
+      else if ([types containsObject: NSHTMLPboardType])
+        {
+          xEvent->target = XG_MIME_HTML;
+          [self xProvideSelection: xEvent];
+        }
+      else if ([types containsObject: NSURLPboardType])
+        {
+          xEvent->target = XG_MIME_URI;
           [self xProvideSelection: xEvent];
         }
     }
@@ -1683,10 +1757,35 @@ xErrorHandler(Display *d, XErrorEvent *e)
       format = 8;
       numItems = [data length];
     }
+  else if (((xEvent->target == XG_MIME_HTML) 
+      || (xEvent->target == XG_MIME_XHTML))
+    && [types containsObject: NSHTMLPboardType])
+    {
+      data = [_pb dataForType: NSHTMLPboardType];
+      xType = xEvent->target;
+      format = 8;
+      numItems = [data length];
+    }
+  else if ((xEvent->target == XG_MIME_URI) 
+    && [types containsObject: NSURLPboardType])
+    {
+      data = [_pb dataForType: NSURLPboardType];
+      xType = xEvent->target;
+      format = 8;
+      numItems = [data length];
+    }
   else if ((xEvent->target == XG_MIME_TIFF)
     && [types containsObject: NSTIFFPboardType])
     {
       data = [_pb dataForType: NSTIFFPboardType];
+      xType = xEvent->target;
+      format = 8;
+      numItems = [data length];
+    }
+  else if ((xEvent->target == XG_MIME_PDF)
+    && [types containsObject: NSPasteboardTypePDF])
+    {
+      data = [_pb dataForType: NSPasteboardTypePDF];
       xType = xEvent->target;
       format = 8;
       numItems = [data length];
